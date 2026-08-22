@@ -97,6 +97,19 @@ public:
     }
 
     // -------------------------------------------------------------------------
+    // would_cross : true if a limit order at (side, price) would match on entry
+    // (i.e. act as a liquidity TAKER) rather than rest passively. A market maker
+    // running "post-only" uses this to REJECT any quote that would cross, so it
+    // never pays the spread as an aggressor -- crucial when quotes are computed
+    // from a slightly stale book and the market has since moved.
+    // -------------------------------------------------------------------------
+    bool would_cross(Side side, Price price) const {
+        if (side == Side::Buy)
+            return !asks_.empty() && asks_.begin()->first <= price;   // lifts an ask
+        return !bids_.empty() && std::prev(bids_.end())->first >= price; // hits a bid
+    }
+
+    // -------------------------------------------------------------------------
     // cancel : remove a resting order by id. O(1) via the locator map.
     // Returns true if the order was found and removed.
     // -------------------------------------------------------------------------
@@ -109,6 +122,7 @@ public:
         auto lvl_it = ladder.find(loc.price);
         if (lvl_it != ladder.end()) {
             PriceLevel& lvl = lvl_it->second;
+            if (loc.order_it->is_ours) --our_resting_;
             lvl.total_qty -= loc.order_it->qty;     // keep cached size correct
             lvl.orders.erase(loc.order_it);         // O(1) list erase
             if (lvl.orders.empty())
@@ -140,6 +154,10 @@ public:
     bool has_bid() const { return !bids_.empty(); }
     bool has_ask() const { return !asks_.empty(); }
     std::size_t resting_orders() const { return locator_.size(); }
+    // Number of OUR (strategy) orders currently resting in the book. A market
+    // maker should keep this tiny (ideally one per side); watching it reveals
+    // "working-order" leaks where stale quotes accumulate faster than we cancel.
+    std::size_t our_resting() const { return our_resting_; }
 
 private:
     // Where a resting order lives, so we can cancel it in O(1).
@@ -181,6 +199,7 @@ private:
 
             if (maker.qty == 0) {
                 // Maker fully filled: remove it from the book.
+                if (maker.is_ours) --our_resting_;
                 locator_.erase(maker.id);
                 lvl.orders.pop_front();
             }
@@ -196,6 +215,7 @@ private:
         PriceLevel& lvl = ladder[in.price];         // creates the level if absent
         lvl.orders.push_back(RestingOrder{in.id, remaining, in.is_ours, in.ts});
         lvl.total_qty += remaining;
+        if (in.is_ours) ++our_resting_;
         // Record where it lives for O(1) cancellation. std::list iterators are
         // stable, so this iterator stays valid until we erase this order.
         locator_[in.id] = Locator{in.side, in.price, std::prev(lvl.orders.end())};
@@ -204,6 +224,7 @@ private:
     Ladder bids_;   // buy orders,  sorted ascending; best (highest) = rbegin()
     Ladder asks_;   // sell orders, sorted ascending; best (lowest)  = begin()
     std::unordered_map<OrderId, Locator> locator_; // id -> location, O(1) cancel
+    std::size_t our_resting_ = 0;                  // count of our live orders
 };
 
 } // namespace qmm::book
