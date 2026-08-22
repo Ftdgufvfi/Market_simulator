@@ -276,7 +276,13 @@ static void run_engine(FeedRing& feed_in, OrderRing& order_in,
         // (b) Drain market data from the feed, measuring queue latency.
         FeedMsg fm;
         while (feed_in.try_pop(fm)) {
-            const std::uint64_t lat_cycles = core::rdtsc() - fm.tsc;
+            // Cross-core __rdtsc reads can occasionally appear very slightly out
+            // of order (the counters are synchronised but not perfectly ordered
+            // w.r.t. surrounding instructions), which would make `now - fm.tsc`
+            // underflow to a garbage huge unsigned value. Guard against that so
+            // one bad sample can never corrupt the max/mean of the histogram.
+            const std::uint64_t now = core::rdtsc();
+            const std::uint64_t lat_cycles = (now > fm.tsc) ? (now - fm.tsc) : 0;
             hist.record(static_cast<std::uint64_t>(clk.cycles_to_ns(lat_cycles)));
 
             const md::OrderMsg& o = fm.order;
@@ -382,7 +388,16 @@ static void run_risk(OrderRing& risk_in, OrderRing& engine_out,
                 if (ok) sh.risk_approved.fetch_add(1, std::memory_order_relaxed);
                 else    sh.risk_rejects.fetch_add(1, std::memory_order_relaxed);
             }
-            if (ok) push_blocking(engine_out, om, sh.risk_done);
+            // Forward approved orders BACK to the engine (the pipeline's one
+            // feedback edge). The abort flag must be the CONSUMER's done-flag
+            // (engine_done), NOT our own: the engine can finish and exit while
+            // we are still draining a backlog of quotes, and if we passed our
+            // own risk_done here (always false inside this loop) a full
+            // order_ring would spin forever and hang shutdown at join(). With
+            // engine_done, once the engine is gone we simply drop these late
+            // quotes -- harmless, since post-only/hard-cap mean they would only
+            // rest or be rejected, never a lost trade.
+            if (ok) push_blocking(engine_out, om, sh.engine_done);
             did_work = true;
         }
         if (did_work) { idle = 0; continue; }
