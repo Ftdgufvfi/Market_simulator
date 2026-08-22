@@ -34,8 +34,8 @@ quant-mm-sim\
 |-- docs\
 |   |-- CONCEPTS.md             # Systems concepts explainer
 |   `-- DESIGN.md               # Detailed implementation design
-|-- bench\                      # Optional benchmark targets when sources exist
-`-- tests\                      # Optional test target when sources exist
+|-- bench\                      # queue_bench (lock comparison) + affinity_bench
+`-- tests\                      # run_tests.cpp: dependency-free unit harness
 ```
 
 ## Build
@@ -57,7 +57,7 @@ Set-Location C:\Users\chkarthik\projects\quant-mm-sim
 ## Run
 
 ```powershell
-.\build\mmsim.exe --events 2000000 --rate 1000000
+.\build\qmm_sim.exe --events 2000000 --rate 1000000
 ```
 
 Options:
@@ -67,6 +67,34 @@ Options:
 | `--events N` | Number of synthetic market-data messages to generate. Default in `main.cpp` is 2,000,000. |
 | `--rate R` | Feed pacing in events/second. `--rate 1000000` offers 1.0 M events/s; `--rate 0` runs unpaced for peak throughput. |
 | `--no-pin` | Disable per-stage CPU pinning and priority boost. Useful for A/B comparisons against the Windows scheduler. |
+
+## Benchmarks and tests
+
+The CMake build also produces two benchmarks and a unit-test binary (all built
+alongside `qmm_sim`):
+
+```powershell
+.\build\queue_bench.exe      # mutex vs spinlock vs lock-free SPSC
+.\build\affinity_bench.exe   # pinning, SMT siblings, and false sharing
+.\build\qmm_tests.exe        # or: ctest --test-dir build --output-on-failure
+```
+
+`queue_bench` measures the true one-way hand-off latency with a **ping-pong**
+(only one message in flight, so the number is the pure core-to-core cost, not
+backlog residence) and streaming throughput. Representative results on the
+AMD EPYC 9V74 (two distinct physical cores):
+
+| Mechanism | latency p50 | latency p99.9 | throughput |
+|---|---:|---:|---:|
+| `std::mutex` + queue | ~956 ns | ~15,400 ns | ~12 M items/s |
+| spinlock + queue | ~155 ns | ~350 ns | ~12 M items/s |
+| lock-free SPSC ring | ~125 ns | ~235 ns | ~312 M items/s |
+
+The lock-free ring wins on both the median and, crucially, the tail: neither
+thread ever blocks or enters the kernel, so it avoids the sleep/wake syscall
+that inflates the mutex tail. `affinity_bench` additionally shows a ~5x
+slowdown from false sharing (two counters on one cache line vs padded onto
+separate lines).
 
 ## Architecture
 
@@ -90,7 +118,7 @@ The stages communicate through fixed-size lock-free SPSC rings. Shared state tha
 
 ## Measured result: AMD EPYC 9V74
 
-Run: `build\mmsim.exe --events 2000000 --rate 1000000` on AMD EPYC 9V74, 8 physical cores / 16 logical CPUs, SMT on, single NUMA node.
+Run: `build\qmm_sim.exe --events 2000000 --rate 1000000` on AMD EPYC 9V74, 8 physical cores / 16 logical CPUs, SMT on, single NUMA node.
 
 | Area | Metric | Result |
 |---|---:|---:|
@@ -120,7 +148,7 @@ That is the classic market-making failure mode: **latency -> stale quotes -> adv
 
 ## Future work
 
-- Add a clean queue benchmark source to all branches that documents unloaded SPSC and MPMC latency separately from full-pipeline jitter.
 - Add configurable strategy parameters for half-spread, quote size and skew coefficients.
 - Add CSV input as a runtime option so deterministic synthetic tapes and recorded tapes share the same executable path.
 - Add ETW/WPA profiling notes for validating thread migration, context switches and core residency during runs.
+- Model uninformed (noise) order flow in the synthetic feed so the maker can be profitable in the zero-latency limit, sharpening the latency-vs-P&L study.
