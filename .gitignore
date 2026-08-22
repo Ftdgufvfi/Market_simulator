@@ -1,5 +1,6 @@
 # Build output
 /build/
+/cmbuild/
 /out/
 *.obj
 *.exe
