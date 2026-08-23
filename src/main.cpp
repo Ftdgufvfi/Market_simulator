@@ -41,8 +41,11 @@
 //      p50/p99/p99.9 -- the numbers that actually matter in trading.
 // =============================================================================
 #include <atomic>
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <memory>
 #include <string>
@@ -51,6 +54,17 @@
 
 #if defined(_MSC_VER)
   #include <intrin.h>   // _mm_pause
+#endif
+
+// On Windows we opt the console into VT (ANSI escape) processing and UTF-8 so
+// the optional live TUI dashboard can redraw in place and use block-glyph
+// sparklines. affinity.hpp already pulls in <windows.h> (with NOMINMAX), but we
+// guard-include here too so this file is self-contained.
+#if defined(_WIN32)
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <windows.h>
 #endif
 
 #include "qmm/core/affinity.hpp"
@@ -89,6 +103,9 @@ struct LatSummary {
     std::size_t   n    = 0;
     std::uint64_t p50  = 0, p99 = 0, p999 = 0, max = 0;
     double        mean = 0.0;
+    // A wider percentile curve (percentile -> latency ns) for the dashboard's
+    // "the tail explodes" chart. Populated alongside the headline numbers.
+    std::vector<std::pair<double, std::uint64_t>> curve;
 };
 
 // -----------------------------------------------------------------------------
@@ -130,7 +147,22 @@ struct Shared {
     std::atomic<long long> risk_approved{0};      // orders passed by risk stage
     std::atomic<long long> hard_cap_drops{0};     // orders stopped by hard cap
     std::atomic<long long> post_only_rejects{0};  // stale quotes that would cross
+
+    // --- Live progress counters (for the optional TUI dashboard) -------------
+    // The engine owns both. events_processed is published in coarse batches
+    // (once per kProgressBatch) so the shared line is touched ~thousands of
+    // times less often than the per-event hot path -- the monitor gets smooth
+    // progress without perturbing the very latency we are measuring. our_fills
+    // is bumped once per fill (fills are rare relative to events, so this is
+    // cheap) and lets the dashboard show live execution activity.
+    std::atomic<std::uint64_t> events_processed{0};
+    std::atomic<std::uint64_t> our_fills{0};
 };
+
+// How many feed events the engine processes between publishes of the shared
+// progress counter (see Shared::events_processed). A power of two so the engine
+// can test it with a cheap bit-mask.
+static constexpr std::uint64_t kProgressBatch = 4096;
 
 // Helper: pin the calling thread to a physical core (first logical CPU of the
 // Nth physical core), if pinning is enabled and that core exists.
@@ -221,6 +253,7 @@ static void run_engine(FeedRing& feed_in, OrderRing& order_in,
             const md::Qty d = (our == md::Side::Buy) ? t.qty : -t.qty;
             const md::Qty newpos =
                 sh.position.fetch_add(d, std::memory_order_relaxed) + d;
+            sh.our_fills.fetch_add(1, std::memory_order_relaxed);  // live fill count
             long long ap = newpos < 0 ? -newpos : newpos;
             long long prev = sh.max_abs_pos.load(std::memory_order_relaxed);
             while (ap > prev && !sh.max_abs_pos.compare_exchange_weak(prev, ap, std::memory_order_relaxed)) {}
@@ -229,6 +262,7 @@ static void run_engine(FeedRing& feed_in, OrderRing& order_in,
     };
 
     std::uint64_t since_top = 0;    // throttle counter for top snapshots
+    std::uint64_t processed_local = 0; // engine-local feed-event tally (batched publish)
     int idle = 0;                   // consecutive idle spins (for clean exit)
     md::Ts last_ts = 0;
 
@@ -302,6 +336,11 @@ static void run_engine(FeedRing& feed_in, OrderRing& order_in,
                                        std::memory_order_relaxed);
                 }
             }
+            // Publish coarse progress for the optional live dashboard. We only
+            // touch the shared line once per kProgressBatch events so the hot
+            // path stays clean and the latency numbers stay honest.
+            if ((++processed_local & (kProgressBatch - 1)) == 0)
+                sh.events_processed.store(processed_local, std::memory_order_relaxed);
             did_work = true;
         }
 
@@ -321,6 +360,7 @@ static void run_engine(FeedRing& feed_in, OrderRing& order_in,
 
     // Publish a final snapshot so late marks use a sane price, then report.
     (void)last_ts;
+    sh.events_processed.store(processed_local, std::memory_order_relaxed);
     sh.engine_done.store(true, std::memory_order_release);
 
     LatSummary s;
@@ -330,6 +370,11 @@ static void run_engine(FeedRing& feed_in, OrderRing& order_in,
     s.p999 = hist.percentile(99.9);
     s.max  = hist.max();
     s.mean = hist.mean();
+    // Wider percentile curve for the dashboard's tail-latency chart. These
+    // ranks visualise how the hand-off stays flat up to ~p95 then explodes in
+    // the tail once queues transiently build under load.
+    for (double p : {1.0, 10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99, 100.0})
+        s.curve.emplace_back(p, hist.percentile(p));
     lat_promise.set_value(s);
 }
 
@@ -462,6 +507,255 @@ static void run_analytics(TradeRing& trade_in, Shared& sh,
 }
 
 // =============================================================================
+//  Optional live TUI dashboard + metrics export.
+//  Both are OFF by default so a plain run produces the same clean, unperturbed
+//  measurements as before. They read only already-published atomics, so they
+//  add no cost to the hot path when disabled.
+// =============================================================================
+
+#if defined(_WIN32)
+// Opt the Windows console into ANSI-escape (VT) processing and UTF-8 output so
+// the dashboard can redraw in place and render block-glyph sparklines.
+static void enable_vt_console() {
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode))
+        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    SetConsoleOutputCP(CP_UTF8);
+}
+#else
+static void enable_vt_console() {}
+#endif
+
+// Append a compact block-glyph sparkline (U+2581..U+2588) of `v` to `out`.
+// We emit the UTF-8 bytes explicitly (E2 96 81..88) rather than using a string
+// literal so the result is independent of the source-file / narrow charset.
+static void sparkline(const std::vector<double>& v, std::string& out) {
+    out.clear();
+    if (v.empty()) return;
+    double lo = v.front(), hi = v.front();
+    for (double x : v) { lo = std::min(lo, x); hi = std::max(hi, x); }
+    const double span = (hi - lo) > 1e-9 ? (hi - lo) : 1.0;
+    for (double x : v) {
+        int lvl = static_cast<int>((x - lo) / span * 7.0 + 0.5);
+        lvl = std::max(0, std::min(7, lvl));
+        out += '\xE2'; out += '\x96'; out += static_cast<char>(0x81 + lvl);
+    }
+}
+
+// Render a fixed-width horizontal bar of length `width`, filled to `frac`.
+static std::string bar(double frac, int width) {
+    frac = std::max(0.0, std::min(1.0, frac));
+    const int fill = static_cast<int>(frac * width + 0.5);
+    return std::string(fill, '#') + std::string(width - fill, '.');
+}
+
+// The live monitor thread. Runs alongside the pipeline, reads the published
+// atomics every ~100 ms and repaints an in-place dashboard until `stop` is set.
+static void run_dashboard(const Shared& sh, std::size_t num_events,
+                          std::atomic<bool>& stop, std::uint64_t start_ns) {
+    // ANSI helpers.
+    constexpr const char* HOME = "\x1b[H";      // cursor to top-left
+    constexpr const char* CLR  = "\x1b[2J";     // clear whole screen
+    constexpr const char* EL   = "\x1b[K";      // clear to end of line
+    constexpr const char* HIDE = "\x1b[?25l";   // hide cursor (no flicker)
+    constexpr const char* SHOW = "\x1b[?25h";   // restore cursor
+    constexpr const char* RST  = "\x1b[0m";
+    constexpr const char* CY   = "\x1b[36m";    // cyan
+    constexpr const char* YL   = "\x1b[33m";    // yellow
+    constexpr const char* GR   = "\x1b[32m";    // green
+    constexpr const char* RD   = "\x1b[31m";    // red
+    constexpr const char* DIM  = "\x1b[2m";
+    constexpr const char* BLD  = "\x1b[1m";
+
+    std::fputs(CLR, stdout);
+    std::fputs(HIDE, stdout);
+
+    std::vector<double> eq_hist;                 // rolling equity samples
+    std::uint64_t prev_events = 0;
+    std::uint64_t prev_ns = start_ns;
+    std::string spark, frame;
+
+    auto paint = [&](bool final_frame) {
+        const std::uint64_t now = core::now_ns();
+        const std::uint64_t ev  = sh.events_processed.load(std::memory_order_relaxed);
+        const long long pos     = static_cast<long long>(sh.position.load(std::memory_order_relaxed));
+        const double eq         = sh.equity.load(std::memory_order_relaxed);
+        const std::uint64_t fills = sh.our_fills.load(std::memory_order_relaxed);
+        const long long peak    = sh.max_abs_pos.load(std::memory_order_relaxed);
+        const long long appr    = sh.risk_approved.load(std::memory_order_relaxed);
+        const long long rej     = sh.risk_rejects.load(std::memory_order_relaxed);
+        const long long po      = sh.post_only_rejects.load(std::memory_order_relaxed);
+        const long long hc      = sh.hard_cap_drops.load(std::memory_order_relaxed);
+        const long long mid     = static_cast<long long>(sh.mid_price.load(std::memory_order_relaxed));
+
+        // Instantaneous + overall throughput.
+        const double dt   = (now > prev_ns) ? (now - prev_ns) / 1e9 : 1e-9;
+        const double inst = (ev >= prev_events) ? (ev - prev_events) / dt / 1e6 : 0.0;
+        const double overall = (now > start_ns) ? ev / ((now - start_ns) / 1e9) / 1e6 : 0.0;
+        prev_events = ev; prev_ns = now;
+
+        eq_hist.push_back(eq);
+        if (eq_hist.size() > 60) eq_hist.erase(eq_hist.begin());
+        sparkline(eq_hist, spark);
+
+        const double prog = num_events ? std::min(1.0, (double)ev / (double)num_events) : 0.0;
+        const char* eqcol = eq >= 0 ? GR : RD;
+        const double invfrac = kHardInventoryCap ? (double)std::llabs(pos) / (double)kHardInventoryCap : 0.0;
+        const char* invcol = invfrac < 0.5 ? GR : (invfrac < 0.85 ? YL : RD);
+
+        frame.clear();
+        frame += HOME;
+        auto line = [&](const std::string& s){ frame += s; frame += EL; frame += "\r\n"; };
+
+        line(std::string(BLD) + CY + "  quant-mm-sim  " + RST + DIM + "| live low-latency market-making pipeline" + RST);
+        line(std::string(DIM) + "  ---------------------------------------------------------------" + RST);
+        {
+            char b[256];
+            std::snprintf(b, sizeof b, "  progress  [%s%s%s] %5.1f%%   %s%s events",
+                          CY, bar(prog, 32).c_str(), RST, prog * 100.0,
+                          std::to_string((unsigned long long)ev).c_str(),
+                          num_events ? ("/" + std::to_string((unsigned long long)num_events)).c_str() : "");
+            line(b);
+        }
+        {
+            char b[256];
+            std::snprintf(b, sizeof b, "  throughput  %s%6.2f M/s%s  (inst)   %s%6.2f M/s%s  (overall)",
+                          YL, inst, RST, DIM, overall, RST);
+            line(b);
+        }
+        line("");
+        {
+            char b[256];
+            std::snprintf(b, sizeof b, "  position  %s%+6lld%s  [%s%s%s]  cap %lld     mid %lld",
+                          invcol, pos, RST, invcol, bar(invfrac, 24).c_str(), RST,
+                          (long long)kHardInventoryCap, mid);
+            line(b);
+        }
+        {
+            char b[256];
+            std::snprintf(b, sizeof b, "  equity    %s%+12.0f%s tick-$   fills %s%llu%s",
+                          eqcol, eq, RST, CY, (unsigned long long)fills, RST);
+            line(b);
+        }
+        {
+            char b[256];
+            std::snprintf(b, sizeof b, "  P&L path  %s%s%s", eqcol, spark.c_str(), RST);
+            line(b);
+        }
+        line("");
+        line(std::string(DIM) + "  -- risk & execution quality ----------------------------------" + RST);
+        {
+            char b[256];
+            std::snprintf(b, sizeof b, "  risk approved %s%lld%s   rejects %s%lld%s   peak|inv| %lld",
+                          GR, appr, RST, (rej ? RD : DIM), rej, RST, peak);
+            line(b);
+        }
+        {
+            char b[256];
+            std::snprintf(b, sizeof b, "  post-only rejects %s%lld%s   hard-cap drops %s%lld%s",
+                          YL, po, RST, (hc ? RD : DIM), hc, RST);
+            line(b);
+        }
+        line("");
+        line(std::string(DIM) + (final_frame ? "  done. final report below." : "  running...  (Ctrl-C to abort)") + RST);
+        // Clear anything left from a previous, taller frame.
+        frame += "\x1b[J";
+        std::fputs(frame.c_str(), stdout);
+        std::fflush(stdout);
+    };
+
+    while (!stop.load(std::memory_order_relaxed)) {
+        paint(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    paint(true);                 // one last frame with the settled numbers
+    std::fputs(SHOW, stdout);    // restore the cursor
+    std::fputs("\r\n", stdout);
+    std::fflush(stdout);
+}
+
+// -----------------------------------------------------------------------------
+// Metrics export. Writes a compact JSON document describing the run so the HTML
+// dashboard (docs/dashboard.html) can visualise it. Hand-rolled to avoid any
+// JSON dependency -- the structure is small and fixed.
+// -----------------------------------------------------------------------------
+static void write_metrics_json(const std::string& path, const core::Topology& topo,
+                               const core::TscClock& clk, std::size_t num_events,
+                               double rate, bool pin, double secs,
+                               const LatSummary& lat,
+                               const analytics::PnLTracker::Stats& st,
+                               const Shared& sh) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { std::fprintf(stderr, "warning: could not open %s for writing\n", path.c_str()); return; }
+
+    f << "{\n";
+    f << "  \"kind\": \"qmm_sim\",\n";
+    f << "  \"config\": {"
+      << " \"events\": " << num_events
+      << ", \"offered_rate\": " << (long long)(rate > 0 ? rate : 0)
+      << ", \"paced\": " << (rate > 0 ? "true" : "false")
+      << ", \"pinning\": " << (pin ? "true" : "false")
+      << ", \"logical\": " << core::hardware_threads()
+      << ", \"physical_cores\": " << topo.cores.size()
+      << ", \"numa_nodes\": " << topo.numa_nodes
+      << ", \"smt\": " << (topo.smt_enabled() ? "true" : "false")
+      << ", \"tsc_cycles_per_ns\": " << clk.cycles_per_ns()
+      << ", \"hard_inventory_cap\": " << (long long)kHardInventoryCap
+      << " },\n";
+    f << "  \"throughput\": {"
+      << " \"seconds\": " << secs
+      << ", \"events\": " << num_events
+      << ", \"achieved_mps\": " << (num_events / secs / 1e6)
+      << " },\n";
+    f << "  \"latency_ns\": {"
+      << " \"n\": " << lat.n
+      << ", \"p50\": " << lat.p50
+      << ", \"p99\": " << lat.p99
+      << ", \"p999\": " << lat.p999
+      << ", \"max\": " << lat.max
+      << ", \"mean\": " << lat.mean
+      << ", \"curve\": [";
+    for (std::size_t i = 0; i < lat.curve.size(); ++i) {
+        if (i) f << ", ";
+        f << "{\"p\": " << lat.curve[i].first << ", \"ns\": " << lat.curve[i].second << "}";
+    }
+    f << "] },\n";
+    f << "  \"pnl\": {"
+      << " \"our_fills\": " << st.our_fills
+      << ", \"final_position\": " << (long long)st.final_position
+      << ", \"final_equity\": " << st.final_equity
+      << ", \"peak_equity\": " << st.peak_equity
+      << ", \"max_drawdown\": " << st.max_drawdown
+      << ", \"sharpe\": " << st.sharpe
+      << " },\n";
+    f << "  \"risk\": {"
+      << " \"peak_abs_inventory\": " << sh.max_abs_pos.load()
+      << ", \"hard_cap\": " << (long long)kHardInventoryCap
+      << ", \"risk_approved\": " << sh.risk_approved.load()
+      << ", \"risk_rejects\": " << sh.risk_rejects.load()
+      << ", \"post_only_rejects\": " << sh.post_only_rejects.load()
+      << ", \"hard_cap_drops\": " << sh.hard_cap_drops.load()
+      << " },\n";
+
+    // Downsample the equity curve to at most kMaxPts points so the JSON (and the
+    // chart) stay lightweight regardless of run length.
+    constexpr std::size_t kMaxPts = 400;
+    const std::vector<double>& ec = st.equity_curve;
+    const std::size_t stride = ec.size() > kMaxPts ? (ec.size() + kMaxPts - 1) / kMaxPts : 1;
+    f << "  \"equity_curve\": [";
+    bool first = true;
+    for (std::size_t i = 0; i < ec.size(); i += stride) {
+        if (!first) f << ", ";
+        f << ec[i];
+        first = false;
+    }
+    f << "]\n";
+    f << "}\n";
+    std::printf("  wrote metrics to %s\n", path.c_str());
+}
+
+// =============================================================================
 //  main : configure, launch the pinned pipeline, collect results via futures.
 // =============================================================================
 int main(int argc, char** argv) {
@@ -469,6 +763,8 @@ int main(int argc, char** argv) {
     std::size_t num_events = 2'000'000;
     bool pin = true;
     double rate = 1'000'000.0;   // offered load (events/s); <=0 means unpaced
+    bool dashboard = false;      // --dashboard : live in-place TUI
+    std::string metrics_out;     // --metrics-out <path> : write JSON metrics
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--events") == 0 && i + 1 < argc)
             num_events = std::strtoull(argv[++i], nullptr, 10);
@@ -476,6 +772,10 @@ int main(int argc, char** argv) {
             rate = std::strtod(argv[++i], nullptr);
         else if (std::strcmp(argv[i], "--no-pin") == 0)
             pin = false;
+        else if (std::strcmp(argv[i], "--dashboard") == 0)
+            dashboard = true;
+        else if (std::strcmp(argv[i], "--metrics-out") == 0 && i + 1 < argc)
+            metrics_out = argv[++i];
     }
 
     const core::Topology topo = core::discover_topology();
@@ -520,11 +820,26 @@ int main(int argc, char** argv) {
     std::thread t_risk (run_risk,     std::ref(*risk_ring), std::ref(*order_ring), std::ref(sh), std::cref(topo), pin);
     std::thread t_anal (run_analytics,std::ref(*trade_ring), std::ref(sh), std::move(stats_promise), std::cref(topo), pin);
 
+    // ---- Optional live TUI: a monitor thread that repaints in place while the
+    //      pipeline runs. It reads only published atomics, so it never touches
+    //      the hot path. Started here so it observes the whole run.
+    std::atomic<bool> ui_stop{false};
+    std::thread t_ui;
+    if (dashboard) {
+        enable_vt_console();
+        t_ui = std::thread(run_dashboard, std::cref(sh), num_events,
+                           std::ref(ui_stop), t_start);
+    }
+
     // ---- Collect results (blocks until each worker fulfils its promise) ----
     const LatSummary lat = lat_future.get();
     const analytics::PnLTracker::Stats st = stats_future.get();
 
     t_feed.join(); t_eng.join(); t_strat.join(); t_risk.join(); t_anal.join();
+
+    // Stop and join the monitor (if running) so its final frame is flushed
+    // before we print the textual report underneath it.
+    if (dashboard) { ui_stop.store(true, std::memory_order_relaxed); t_ui.join(); }
 
     const std::uint64_t t_end = core::now_ns();
     const double secs = (t_end - t_start) / 1e9;
@@ -559,5 +874,11 @@ int main(int argc, char** argv) {
                 sh.post_only_rejects.load());
     std::printf("  hard_cap_drops=%lld    (orders stopped by the engine inventory cap)\n",
                 sh.hard_cap_drops.load());
+
+    // ---- Optional metrics export for the HTML dashboard ----
+    if (!metrics_out.empty()) {
+        std::printf("\n--- metrics export ---\n");
+        write_metrics_json(metrics_out, topo, clk, num_events, rate, pin, secs, lat, st, sh);
+    }
     return 0;
 }

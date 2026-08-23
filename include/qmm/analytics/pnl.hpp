@@ -50,6 +50,9 @@ public:
         double  sharpe         = 0.0;
         double  max_drawdown   = 0.0;   // tick-dollars (>= 0)
         double  peak_equity    = 0.0;
+        // The full sampled mark-to-market equity curve (one point per mark()).
+        // Returned so the dashboard/report can plot the P&L path over the run.
+        std::vector<double> equity_curve;
     };
 
     // Process one trade. Updates position & cash only if WE were involved.
@@ -103,6 +106,7 @@ public:
         s.max_drawdown   = max_drawdown_;
         s.peak_equity    = peak_equity_;
         s.sharpe         = compute_sharpe();
+        s.equity_curve   = equity_curve_;   // copy the sampled P&L path out
         return s;
     }
 

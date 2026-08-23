@@ -35,9 +35,13 @@
 // =============================================================================
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "qmm/core/affinity.hpp"
 #include "qmm/core/latency_histogram.hpp"
@@ -54,6 +58,34 @@ struct Msg {
     std::uint64_t seq = 0;
     std::uint64_t tsc = 0;
 };
+
+// One row of latency results for a single hand-off mechanism. Captured so we can
+// both pretty-print it AND serialise it to JSON for the HTML dashboard.
+struct LatRow {
+    std::string   label;
+    std::size_t   n = 0;
+    std::uint64_t min = 0, p50 = 0, p90 = 0, p99 = 0, p999 = 0, max = 0;
+    double        mean = 0.0;
+};
+
+// One labelled throughput result (M items/second).
+struct TputRow { std::string label; double mps = 0.0; };
+
+// Build a LatRow from a populated histogram and print the usual one-line summary.
+LatRow summarize(LatencyHistogram& h, const char* label) {
+    LatRow r;
+    r.label = label;
+    r.n    = h.count();
+    r.min  = h.min();
+    r.p50  = h.percentile(50.0);
+    r.p90  = h.percentile(90.0);
+    r.p99  = h.percentile(99.0);
+    r.p999 = h.percentile(99.9);
+    r.max  = h.max();
+    r.mean = h.mean();
+    h.print_summary(label);
+    return r;
+}
 
 constexpr int kPingPong = 200'000;   // measured round-trips for the latency test
 constexpr int kStream   = 2'000'000; // measured items for the throughput test
@@ -97,7 +129,7 @@ struct LockedChannel {
 
 // ---- PING-PONG latency for a pair of LockedChannels -------------------------
 template <typename Lock>
-void pingpong_locked(const char* label, const CorePair& cores, const TscClock& clk) {
+LatRow pingpong_locked(const char* label, const CorePair& cores, const TscClock& clk) {
     LockedChannel<Lock> a2b;   // A -> B
     LockedChannel<Lock> b2a;   // B -> A (the echo)
     LatencyHistogram hist(kPingPong);
@@ -124,11 +156,11 @@ void pingpong_locked(const char* label, const CorePair& cores, const TscClock& c
             hist.record((std::uint64_t)(clk.cycles_to_ns(rt) / 2.0));  // one-way
     }
     responder.join();
-    hist.print_summary(label);
+    return summarize(hist, label);
 }
 
 // ---- PING-PONG latency for a pair of lock-free SPSC rings -------------------
-void pingpong_spsc(const char* label, const CorePair& cores, const TscClock& clk) {
+LatRow pingpong_spsc(const char* label, const CorePair& cores, const TscClock& clk) {
     SpscRing<Msg, 1024> a2b;
     SpscRing<Msg, 1024> b2a;
     LatencyHistogram hist(kPingPong);
@@ -153,7 +185,7 @@ void pingpong_spsc(const char* label, const CorePair& cores, const TscClock& clk
             hist.record((std::uint64_t)(clk.cycles_to_ns(rt) / 2.0));
     }
     responder.join();
-    hist.print_summary(label);
+    return summarize(hist, label);
 }
 
 // -----------------------------------------------------------------------------
@@ -191,7 +223,47 @@ double stream_spsc(const CorePair& cores) {
 
 } // namespace
 
-int main() {
+// Serialise the collected benchmark results to JSON for the HTML dashboard.
+static void write_bench_json(const std::string& path, const Topology& topo,
+                             const CorePair& cores, const TscClock& clk,
+                             const std::vector<LatRow>& lat,
+                             const std::vector<TputRow>& tput) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { std::fprintf(stderr, "warning: could not open %s for writing\n", path.c_str()); return; }
+    f << "{\n";
+    f << "  \"kind\": \"queue_bench\",\n";
+    f << "  \"topology\": {"
+      << " \"physical_cores\": " << topo.cores.size()
+      << ", \"smt\": " << (topo.smt_enabled() ? "true" : "false")
+      << ", \"a_cpu\": " << cores.a_cpu
+      << ", \"b_cpu\": " << cores.b_cpu
+      << ", \"tsc_cycles_per_ns\": " << clk.cycles_per_ns()
+      << " },\n";
+    f << "  \"latency_ns\": [\n";
+    for (std::size_t i = 0; i < lat.size(); ++i) {
+        const LatRow& r = lat[i];
+        f << "    {\"label\": \"" << r.label << "\", \"n\": " << r.n
+          << ", \"min\": " << r.min << ", \"p50\": " << r.p50 << ", \"p90\": " << r.p90
+          << ", \"p99\": " << r.p99 << ", \"p999\": " << r.p999 << ", \"max\": " << r.max
+          << ", \"mean\": " << r.mean << "}" << (i + 1 < lat.size() ? "," : "") << "\n";
+    }
+    f << "  ],\n";
+    f << "  \"throughput_mps\": [\n";
+    for (std::size_t i = 0; i < tput.size(); ++i) {
+        f << "    {\"label\": \"" << tput[i].label << "\", \"mps\": " << tput[i].mps << "}"
+          << (i + 1 < tput.size() ? "," : "") << "\n";
+    }
+    f << "  ]\n";
+    f << "}\n";
+    std::printf("\nwrote bench metrics to %s\n", path.c_str());
+}
+
+int main(int argc, char** argv) {
+    // --json <path> optionally writes the results for the HTML dashboard.
+    std::string json_out;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--json") == 0 && i + 1 < argc) json_out = argv[++i];
+
     const Topology topo = discover_topology();
     const CorePair cores = choose_cores(topo);
     const TscClock clk = TscClock::calibrate();
@@ -204,20 +276,27 @@ int main() {
 
     // (A) One-way hand-off latency (ping-pong, only one message in flight).
     std::printf("--- one-way hand-off latency (ping-pong, %d samples) ---\n", kPingPong);
-    pingpong_locked<std::mutex>("std::mutex + queue", cores, clk);
-    pingpong_locked<Spinlock>  ("spinlock + queue",   cores, clk);
-    pingpong_spsc             ("lock-free SPSC ring", cores, clk);
+    std::vector<LatRow> lat;
+    lat.push_back(pingpong_locked<std::mutex>("std::mutex + queue", cores, clk));
+    lat.push_back(pingpong_locked<Spinlock>  ("spinlock + queue",   cores, clk));
+    lat.push_back(pingpong_spsc             ("lock-free SPSC ring", cores, clk));
 
     // (B) Saturated throughput (streaming producer -> consumer).
     std::printf("\n--- streaming throughput (%d items) ---\n", kStream);
-    std::printf("  %-22s  %.2f M items/s\n", "std::mutex + queue", stream_locked<std::mutex>(cores));
-    std::printf("  %-22s  %.2f M items/s\n", "spinlock + queue",   stream_locked<Spinlock>(cores));
-    std::printf("  %-22s  %.2f M items/s\n", "lock-free SPSC ring", stream_spsc(cores));
+    std::vector<TputRow> tput;
+    tput.push_back({"std::mutex + queue",  stream_locked<std::mutex>(cores)});
+    tput.push_back({"spinlock + queue",    stream_locked<Spinlock>(cores)});
+    tput.push_back({"lock-free SPSC ring", stream_spsc(cores)});
+    for (const TputRow& t : tput)
+        std::printf("  %-22s  %.2f M items/s\n", t.label.c_str(), t.mps);
 
     std::printf("\nTakeaway: the lock-free ring should show BOTH the lowest p50\n"
                 "and (crucially) the tightest tail, because neither thread ever\n"
                 "blocks or enters the kernel. The std::mutex variant pays a\n"
                 "syscall whenever it must sleep/wake a thread, which inflates its\n"
                 "p99/p99.9 tail even when its average looks acceptable.\n");
+
+    if (!json_out.empty())
+        write_bench_json(json_out, topo, cores, clk, lat, tput);
     return 0;
 }

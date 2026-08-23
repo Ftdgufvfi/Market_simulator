@@ -21,9 +21,11 @@ For the deeper systems primer, see [docs\CONCEPTS.md](docs/CONCEPTS.md). For imp
 quant-mm-sim\
 |-- CMakeLists.txt              # C++20 CMake/Ninja build; header-only qmm_core
 |-- scripts\
-|   `-- build.ps1               # Finds VS via vswhere, enters vcvars64, builds
+|   |-- build.ps1               # Finds VS via vswhere, enters vcvars64, builds
+|   |-- run-all.ps1             # One command: build, test, run demos, make data.js
+|   `-- gen-dashboard-data.ps1  # Packages metrics JSON into docs\data.js
 |-- src\
-|   `-- main.cpp                # Five-stage pinned pipeline and CLI
+|   `-- main.cpp                # Five-stage pinned pipeline, CLI, TUI, metrics export
 |-- include\qmm\
 |   |-- core\                   # Cache padding, timing, rings, spinlock, affinity
 |   |-- md\                     # Market-data types and deterministic synthetic feed
@@ -33,7 +35,9 @@ quant-mm-sim\
 |   `-- analytics\              # P&L, Sharpe and drawdown tracking
 |-- docs\
 |   |-- CONCEPTS.md             # Systems concepts explainer
-|   `-- DESIGN.md               # Detailed implementation design
+|   |-- DESIGN.md               # Detailed implementation design
+|   |-- dashboard.html          # Self-contained HTML report dashboard (Chart.js)
+|   `-- data.js                 # Generated metrics for the HTML dashboard
 |-- bench\                      # queue_bench (lock comparison) + affinity_bench
 `-- tests\                      # run_tests.cpp: dependency-free unit harness
 ```
@@ -67,6 +71,29 @@ Options:
 | `--events N` | Number of synthetic market-data messages to generate. Default in `main.cpp` is 2,000,000. |
 | `--rate R` | Feed pacing in events/second. `--rate 1000000` offers 1.0 M events/s; `--rate 0` runs unpaced for peak throughput. |
 | `--no-pin` | Disable per-stage CPU pinning and priority boost. Useful for A/B comparisons against the Windows scheduler. |
+| `--dashboard` | Draw a live, in-place terminal (TUI) dashboard while the run executes: progress, instantaneous/overall throughput, inventory gauge, a P&L sparkline, and the risk/execution counters. |
+| `--metrics-out PATH` | Write a JSON metrics document (config, throughput, latency percentile curve, P&L, risk, downsampled equity curve) to `PATH`. Consumed by the HTML dashboard. |
+
+### Dashboards
+
+Two complementary views are included:
+
+- **Live terminal dashboard** — pass `--dashboard` to watch the pipeline in real time (best with a longer run so the frames are visible):
+
+  ```powershell
+  .\build\qmm_sim.exe --events 5000000 --rate 500000 --dashboard
+  ```
+
+  It redraws in place using ANSI/VT sequences and a Unicode-block P&L sparkline (the console is switched to VT + UTF-8 automatically on Windows).
+
+- **HTML report dashboard** — `docs\dashboard.html` is a single, self-contained, dark-themed page (Chart.js via CDN) that renders KPI cards, the equity curve, the feed→engine tail-latency curve, the lock-comparison charts, and a risk panel. It loads its data from `docs\data.js`, which is generated from the binaries:
+
+  ```powershell
+  .\scripts\run-all.ps1        # builds, runs, and packages docs\data.js
+  # then open docs\dashboard.html in a browser (works over file:// and GitHub Pages)
+  ```
+
+  Under the hood, `run-all.ps1` runs `qmm_sim --metrics-out build\metrics.json` and `queue_bench --json build\bench.json`, then `scripts\gen-dashboard-data.ps1` wraps both into `docs\data.js` (`window.QMM_METRICS` / `window.QMM_BENCH`). Every panel degrades gracefully with a placeholder if `data.js` is missing.
 
 ## Benchmarks and tests
 

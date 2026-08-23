@@ -49,15 +49,22 @@ Run-Exe "qmm_tests.exe" @()
 
 # --- 3. Simulator -----------------------------------------------------------
 Section "3/5  MARKET-MAKING SIMULATOR  (--events $Events --rate $Rate)"
-Run-Exe "qmm_sim.exe" @("--events", "$Events", "--rate", "$Rate")
+$MetricsJson = Join-Path $BuildDir "metrics.json"
+Run-Exe "qmm_sim.exe" @("--events", "$Events", "--rate", "$Rate", "--metrics-out", "$MetricsJson")
 
 # --- 4. Queue benchmark -----------------------------------------------------
 Section "4/5  QUEUE BENCHMARK  (mutex vs spinlock vs lock-free SPSC)"
-Run-Exe "queue_bench.exe" @()
+$BenchJson = Join-Path $BuildDir "bench.json"
+Run-Exe "queue_bench.exe" @("--json", "$BenchJson")
 
 # --- 5. Affinity benchmark --------------------------------------------------
 Section "5/5  AFFINITY / SMT / FALSE-SHARING BENCHMARK"
 Run-Exe "affinity_bench.exe" @()
+
+# --- Package the metrics into docs\data.js for the HTML dashboard -----------
+Section "DASHBOARD  (packaging docs\data.js)"
+& (Join-Path $PSScriptRoot "gen-dashboard-data.ps1") -Metrics $MetricsJson -Bench $BenchJson
+Write-Host "Open docs\dashboard.html in a browser to view the report." -ForegroundColor Cyan
 
 Write-Host ""
 Write-Host "All stages completed successfully." -ForegroundColor Green
