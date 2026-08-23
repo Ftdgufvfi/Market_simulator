@@ -157,6 +157,17 @@ struct Shared {
     // cheap) and lets the dashboard show live execution activity.
     std::atomic<std::uint64_t> events_processed{0};
     std::atomic<std::uint64_t> our_fills{0};
+
+    // Live top-of-book, published by the engine on each throttled snapshot so
+    // the dashboard can show the market the strategy is quoting against.
+    std::atomic<md::Price> best_bid{0};
+    std::atomic<md::Price> best_ask{0};
+    std::atomic<md::Qty>   bid_qty{0};
+    std::atomic<md::Qty>   ask_qty{0};
+    // Exponentially-weighted moving average of feed->engine hand-off latency
+    // (ns). A cheap live proxy for the median that the dashboard can display
+    // without maintaining a full running histogram on the hot path.
+    std::atomic<double>    lat_ewma{0.0};
 };
 
 // How many feed events the engine processes between publishes of the shared
@@ -263,6 +274,7 @@ static void run_engine(FeedRing& feed_in, OrderRing& order_in,
 
     std::uint64_t since_top = 0;    // throttle counter for top snapshots
     std::uint64_t processed_local = 0; // engine-local feed-event tally (batched publish)
+    double lat_ewma_local = 0.0;    // engine-local latency EWMA (batched publish)
     int idle = 0;                   // consecutive idle spins (for clean exit)
     md::Ts last_ts = 0;
 
@@ -317,7 +329,13 @@ static void run_engine(FeedRing& feed_in, OrderRing& order_in,
             // one bad sample can never corrupt the max/mean of the histogram.
             const std::uint64_t now = core::rdtsc();
             const std::uint64_t lat_cycles = (now > fm.tsc) ? (now - fm.tsc) : 0;
-            hist.record(static_cast<std::uint64_t>(clk.cycles_to_ns(lat_cycles)));
+            const double lat_ns = clk.cycles_to_ns(lat_cycles);
+            hist.record(static_cast<std::uint64_t>(lat_ns));
+            // Update a live latency EWMA (published in batches below). The first
+            // sample seeds it; thereafter a small alpha gives a smooth median-ish
+            // read that tracks the current regime without hot-path bookkeeping.
+            lat_ewma_local = (lat_ewma_local <= 0.0) ? lat_ns
+                                                     : lat_ewma_local * 0.995 + lat_ns * 0.005;
 
             const md::OrderMsg& o = fm.order;
             last_ts = o.ts;
@@ -334,13 +352,20 @@ static void run_engine(FeedRing& feed_in, OrderRing& order_in,
                     // Publish the live mid for fair inventory marking downstream.
                     sh.mid_price.store((t.bid_price + t.ask_price) / 2,
                                        std::memory_order_relaxed);
+                    // Publish the live top-of-book for the dashboard.
+                    sh.best_bid.store(t.bid_price, std::memory_order_relaxed);
+                    sh.best_ask.store(t.ask_price, std::memory_order_relaxed);
+                    sh.bid_qty.store(t.bid_qty,   std::memory_order_relaxed);
+                    sh.ask_qty.store(t.ask_qty,   std::memory_order_relaxed);
                 }
             }
             // Publish coarse progress for the optional live dashboard. We only
             // touch the shared line once per kProgressBatch events so the hot
             // path stays clean and the latency numbers stay honest.
-            if ((++processed_local & (kProgressBatch - 1)) == 0)
+            if ((++processed_local & (kProgressBatch - 1)) == 0) {
                 sh.events_processed.store(processed_local, std::memory_order_relaxed);
+                sh.lat_ewma.store(lat_ewma_local, std::memory_order_relaxed);
+            }
             did_work = true;
         }
 
@@ -572,9 +597,11 @@ static void run_dashboard(const Shared& sh, std::size_t num_events,
     std::fputs(HIDE, stdout);
 
     std::vector<double> eq_hist;                 // rolling equity samples
+    std::vector<double> tp_hist;                 // rolling throughput samples
+    std::vector<double> pos_hist;                // rolling position samples
     std::uint64_t prev_events = 0;
     std::uint64_t prev_ns = start_ns;
-    std::string spark, frame;
+    std::string spark, spark_tp, spark_pos, frame;
 
     auto paint = [&](bool final_frame) {
         const std::uint64_t now = core::now_ns();
@@ -588,6 +615,11 @@ static void run_dashboard(const Shared& sh, std::size_t num_events,
         const long long po      = sh.post_only_rejects.load(std::memory_order_relaxed);
         const long long hc      = sh.hard_cap_drops.load(std::memory_order_relaxed);
         const long long mid     = static_cast<long long>(sh.mid_price.load(std::memory_order_relaxed));
+        const long long bbid    = static_cast<long long>(sh.best_bid.load(std::memory_order_relaxed));
+        const long long bask    = static_cast<long long>(sh.best_ask.load(std::memory_order_relaxed));
+        const long long bqty    = static_cast<long long>(sh.bid_qty.load(std::memory_order_relaxed));
+        const long long aqty    = static_cast<long long>(sh.ask_qty.load(std::memory_order_relaxed));
+        const double lat_live   = sh.lat_ewma.load(std::memory_order_relaxed);
 
         // Instantaneous + overall throughput.
         const double dt   = (now > prev_ns) ? (now - prev_ns) / 1e9 : 1e-9;
@@ -598,6 +630,12 @@ static void run_dashboard(const Shared& sh, std::size_t num_events,
         eq_hist.push_back(eq);
         if (eq_hist.size() > 60) eq_hist.erase(eq_hist.begin());
         sparkline(eq_hist, spark);
+        tp_hist.push_back(inst);
+        if (tp_hist.size() > 40) tp_hist.erase(tp_hist.begin());
+        sparkline(tp_hist, spark_tp);
+        pos_hist.push_back(static_cast<double>(pos));
+        if (pos_hist.size() > 40) pos_hist.erase(pos_hist.begin());
+        sparkline(pos_hist, spark_pos);
 
         const double prog = num_events ? std::min(1.0, (double)ev / (double)num_events) : 0.0;
         const char* eqcol = eq >= 0 ? GR : RD;
@@ -619,17 +657,52 @@ static void run_dashboard(const Shared& sh, std::size_t num_events,
             line(b);
         }
         {
+            char b[320];
+            std::snprintf(b, sizeof b, "  throughput  %s%6.2f M/s%s  (inst)   %s%6.2f M/s%s  (overall)  %s%s%s",
+                          YL, inst, RST, DIM, overall, RST, DIM, spark_tp.c_str(), RST);
+            line(b);
+        }
+        {
+            // Live feed->engine latency (EWMA proxy for p50) -- colour by regime.
+            const char* lcol = lat_live < 300 ? GR : (lat_live < 2000 ? YL : RD);
             char b[256];
-            std::snprintf(b, sizeof b, "  throughput  %s%6.2f M/s%s  (inst)   %s%6.2f M/s%s  (overall)",
-                          YL, inst, RST, DIM, overall, RST);
+            std::snprintf(b, sizeof b, "  latency     %s%7.0f ns%s  (live EWMA, feed->engine hand-off)",
+                          lcol, lat_live, RST);
+            line(b);
+        }
+        line("");
+        line(std::string(DIM) + "  -- market (top of book) --------------------------------------" + RST);
+        {
+            // A compact L1 order-book view: best bid size/price | price/size ask,
+            // the spread in ticks, and the queue imbalance as a centred gauge.
+            const long long spr = (bask > bbid) ? (bask - bbid) : 0;
+            const double denom = static_cast<double>(bqty + aqty);
+            const double imb = denom > 0 ? (bqty - aqty) / denom : 0.0; // [-1,+1]
+            // Centred imbalance bar: left half = sell pressure, right = buy.
+            const int half = 12;
+            int mag = static_cast<int>(std::llabs((long long)(imb * half)));
+            mag = std::max(0, std::min(half, mag));
+            std::string g = std::string(half - (imb < 0 ? mag : 0), ' ')
+                          + std::string(imb < 0 ? mag : 0, '<')
+                          + "|"
+                          + std::string(imb > 0 ? mag : 0, '>')
+                          + std::string(half - (imb > 0 ? mag : 0), ' ');
+            const char* icol = imb > 0.05 ? GR : (imb < -0.05 ? RD : DIM);
+            char b[320];
+            std::snprintf(b, sizeof b,
+                          "  bid %s%lld%s x %lld   %s|%s   %lld x ask %s%lld%s    spread %s%lldt%s",
+                          GR, bbid, RST, bqty, DIM, RST, aqty, RD, bask, RST, YL, spr, RST);
+            line(b);
+            std::snprintf(b, sizeof b, "  imbalance   %s[%s]%s  %s%+.2f%s     mid %s%lld%s",
+                          icol, g.c_str(), RST, icol, imb, RST, CY, mid, RST);
             line(b);
         }
         line("");
         {
-            char b[256];
-            std::snprintf(b, sizeof b, "  position  %s%+6lld%s  [%s%s%s]  cap %lld     mid %lld",
+            char b[320];
+            std::snprintf(b, sizeof b, "  position  %s%+6lld%s  [%s%s%s]  cap %lld     %s%s%s",
                           invcol, pos, RST, invcol, bar(invfrac, 24).c_str(), RST,
-                          (long long)kHardInventoryCap, mid);
+                          (long long)kHardInventoryCap, DIM, spark_pos.c_str(), RST);
             line(b);
         }
         {
